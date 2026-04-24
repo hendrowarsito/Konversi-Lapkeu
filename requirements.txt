@@ -1,0 +1,14 @@
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.24.0
+Pillow>=10.0.0
+openpyxl>=3.1.0
+anthropic>=0.25.0
+
+# PDF support
+pypdf>=4.0.0
+pdf2image>=1.17.0
+
+# OCR Engines (opsional, minimal salah satu)
+pytesseract>=0.3.10
+easyocr>=1.7.0
