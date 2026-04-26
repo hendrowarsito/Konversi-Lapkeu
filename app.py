@@ -360,13 +360,15 @@ def ocr_via_claude_vision(
 
 def parse_vision_json(json_text: str, num_value_cols: int = 2) -> pd.DataFrame:
     """
-    Parse JSON yang dikembalikan Claude Vision API menjadi DataFrame.
-    Ini lebih akurat daripada parse_ocr_text karena Claude sudah
-    memahami struktur laporan secara visual.
+    Parse JSON dari Claude Vision API menjadi DataFrame.
+
+    PENTING: num_value_cols hanya sebagai MINIMUM.
+    Jika Claude mengembalikan 4 kolom nilai, DataFrame akan punya 4 kolom.
+    Jangan potong dengan [:num_value_cols] — itu yang menyebabkan
+    Nilai_3 dan Nilai_4 selalu kosong meskipun data ada.
     """
     import json
 
-    # Bersihkan JSON dari markdown fence jika ada
     clean = json_text.strip()
     if clean.startswith("```"):
         clean = re.sub(r"^```(?:json)?\s*", "", clean)
@@ -378,13 +380,24 @@ def parse_vision_json(json_text: str, num_value_cols: int = 2) -> pd.DataFrame:
         st.warning(f"JSON dari Claude tidak valid: {e}. Mencoba parse sebagai teks biasa...")
         return parse_ocr_text(json_text, num_value_cols=num_value_cols)
 
+    rows_raw = data.get("rows", [])
+    if not rows_raw:
+        return pd.DataFrame(
+            columns=["Tipe", "Keterangan", "Catatan"] +
+                    [f"Nilai_{k+1}" for k in range(num_value_cols)]
+        )
+
+    # Tentukan jumlah kolom aktual: max panjang nilai di semua baris,
+    # minimal num_value_cols
+    max_nilai = max((len(r.get("nilai", [])) for r in rows_raw), default=0)
+    actual_cols = max(num_value_cols, max_nilai)
+
     rows_out = []
-    for row in data.get("rows", []):
-        nilai = row.get("nilai", [])
-        # Padding
-        while len(nilai) < num_value_cols:
+    for row in rows_raw:
+        nilai = list(row.get("nilai", []))
+        # Padding ke actual_cols jika kurang (jangan dipotong)
+        while len(nilai) < actual_cols:
             nilai.append(None)
-        nilai = nilai[:num_value_cols]
 
         rows_out.append({
             "Tipe":       row.get("tipe", "item"),
@@ -392,12 +405,6 @@ def parse_vision_json(json_text: str, num_value_cols: int = 2) -> pd.DataFrame:
             "Catatan":    row.get("catatan", ""),
             **{f"Nilai_{k+1}": v for k, v in enumerate(nilai)},
         })
-
-    if not rows_out:
-        return pd.DataFrame(
-            columns=["Tipe", "Keterangan", "Catatan"] +
-                    [f"Nilai_{k+1}" for k in range(num_value_cols)]
-        )
 
     return pd.DataFrame(rows_out)
 
@@ -444,13 +451,14 @@ def detect_report_type(text: str) -> str:
     return best if scores[best] >= 2 else "unknown"
 
 
-def detect_years(text: str) -> list[str]:
-    """Ekstrak tahun-tahun yang muncul (biasanya 2 tahun: current vs prior)."""
-    # Cari pola 4 digit tahun (2000-2099)
+def detect_years(text: str, max_years: int = 5) -> list[str]:
+    """
+    Ekstrak tahun-tahun yang muncul dalam teks.
+    Mendukung hingga max_years tahun (default 5) — bukan 2 saja.
+    """
     years = re.findall(r"\b(20[0-3]\d)\b", text)
-    # Urutkan unik dari terbaru ke terlama, ambil maks 2
     unique_sorted = sorted(set(years), reverse=True)
-    return unique_sorted[:2] if unique_sorted else ["Tahun 1", "Tahun 2"]
+    return unique_sorted[:max_years] if unique_sorted else ["Tahun 1", "Tahun 2"]
 
 
 # =============================================================================
@@ -650,16 +658,16 @@ def detect_header_row(lines: list[str], scan_rows: int = 8) -> dict:
     for i, line in enumerate(lines[:scan_rows]):
         years_found = _PAT_YEAR.findall(line)
         if len(years_found) >= 1:
-            # Temukan posisi karakter setiap tahun
             positions = [m.end() + 10 for m in _PAT_YEAR.finditer(line)]
             result['header_line']   = line
             result['header_idx']    = i
-            result['years']         = sorted(set(years_found), reverse=True)[:2]
+            # Ambil hingga 5 tahun — jangan batasi ke 2
+            result['years']         = sorted(set(years_found), reverse=True)[:5]
             result['col_positions'] = positions
-            # Jika hanya 1 tahun di baris ini, cek baris berikutnya juga
+            # Jika kurang dari yang diharapkan, cek baris berikutnya
             if len(result['years']) < 2 and i + 1 < len(lines):
                 next_years = _PAT_YEAR.findall(lines[i + 1])
-                all_years = sorted(set(years_found + next_years), reverse=True)[:2]
+                all_years = sorted(set(years_found + next_years), reverse=True)[:5]
                 result['years'] = all_years
             break
 
@@ -910,20 +918,23 @@ def reconstruct_labels(
 
 def parse_ocr_text(text: str, num_value_cols: int = 2) -> pd.DataFrame:
     """
-    Algoritma 3-langkah (ide Pak Hendro):
-
+    Algoritma 3-langkah:
     1. Scan baris awal → deteksi header kolom tahun
-    2. Filter HANYA baris yang memiliki angka keuangan (≥7 digit)
-    3. Rekonstruksi label akun multi-baris dengan melihat ke atas dari
-       setiap baris berAngka, gabungkan baris continuation, skip ALL CAPS
+    2. Filter baris berAngka
+    3. Rekonstruksi label multi-baris
 
-    Hasilnya jauh lebih akurat untuk laporan dengan akun yang labelnya
-    tersebar di 2-4 baris (uraian penyisihan, keterangan tambahan, dll).
+    PENTING: num_value_cols hanya dipakai sebagai MINIMUM fallback.
+    Jika header berhasil mendeteksi lebih banyak tahun (misal 4 tahun),
+    maka otomatis pakai jumlah tahun tersebut. Ini memastikan laporan
+    dengan 4 kolom tahun menghasilkan 4 Nilai_ kolom, bukan 2.
     """
     lines = text.split("\n")
 
-    # Langkah 1
+    # Langkah 1 — deteksi header
     header_info = detect_header_row(lines, scan_rows=8)
+
+    # Gunakan jumlah tahun aktual jika lebih besar dari num_value_cols
+    actual_cols = max(num_value_cols, len(header_info['years']))
 
     # Langkah 2
     numeric_lines = filter_numeric_lines(lines, header_info['header_idx'])
@@ -931,7 +942,7 @@ def parse_ocr_text(text: str, num_value_cols: int = 2) -> pd.DataFrame:
     # Langkah 3
     df = reconstruct_labels(lines, numeric_lines,
                             header_idx=header_info['header_idx'],
-                            num_value_cols=num_value_cols)
+                            num_value_cols=actual_cols)
 
     return df
 
@@ -1828,7 +1839,7 @@ def _process_selected_pages(page_configs: dict):
             # ── Parse ────────────────────────────────────────────────────
             if mode == "vision":
                 df = parse_vision_json(raw, num_value_cols=n_cols)
-                # Ambil years dari JSON jika ada
+                # Ambil years dari JSON — ini adalah sumber paling akurat
                 try:
                     clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
                     json_data  = json.loads(clean_json)
@@ -1837,17 +1848,34 @@ def _process_selected_pages(page_configs: dict):
                         all_years = json_years
                 except Exception:
                     pass
+                # Jika years dari JSON kosong, hitung dari kolom df
+                if not all_years:
+                    n_val = len([c for c in df.columns if c.startswith("Nilai_")])
+                    all_years = [f"Tahun {i+1}" for i in range(n_val)]
             else:
                 df = parse_ocr_text(raw, num_value_cols=n_cols)
                 if not all_years:
                     all_years = detect_years(raw)
+                # Sinkronkan all_years dengan jumlah kolom aktual di df
+                n_val = len([c for c in df.columns if c.startswith("Nilai_")])
+                if n_val > len(all_years):
+                    # Ada lebih banyak kolom dari tahun yang terdeteksi
+                    # Tambah placeholder
+                    all_years = list(all_years) + [f"Tahun {i+1}" for i in range(len(all_years), n_val)]
+                elif n_val < len(all_years):
+                    all_years = all_years[:n_val]
 
             if df.empty:
                 errors.append(f"{fname} hal.{pg_idx+1}: DataFrame kosong")
                 continue
 
-            # ── Filter tahun ─────────────────────────────────────────────
-            df_out, final_years = _filter_df_to_years(df, all_years, t_years)
+            # ── Filter tahun (HANYA jika user memilih subset) ────────────
+            # Jika t_years = all_years (user pilih semua) → JANGAN filter,
+            # langsung pakai df penuh untuk menghindari kehilangan data
+            if t_years and set(t_years) != set(all_years):
+                df_out, final_years = _filter_df_to_years(df, all_years, t_years)
+            else:
+                df_out, final_years = df, list(all_years)
 
             # ── Simpan ke ocr_results ────────────────────────────────────
             result_key = f"{fname} › hal.{pg_idx+1} › {rtype}"
@@ -2306,6 +2334,7 @@ def run_ocr_on_files(uploaded_files):
     engine    = st.session_state.ocr_engine
     api_key   = st.session_state.get("claude_api_key", "")
     vis_model = st.session_state.get("claude_vision_model", "claude-haiku-4-5-20251001")
+    n_cols    = st.session_state.num_value_cols
 
     progress = st.progress(0, text="Memulai ekstraksi...")
     total    = len(uploaded_files)
@@ -2316,8 +2345,7 @@ def run_ocr_on_files(uploaded_files):
             continue
 
         label = "Claude Vision" if engine == "claude_vision" else "OCR"
-        progress.progress((i + 1) / total,
-                          text=f"{label}: {f.name} ({i+1}/{total})")
+        progress.progress((i + 1) / total, text=f"{label}: {f.name} ({i+1}/{total})")
         try:
             image = Image.open(f)
             raw, mode = ocr_image_smart(image, engine, api_key, vis_model)
@@ -2326,31 +2354,40 @@ def run_ocr_on_files(uploaded_files):
                 st.warning(f"⚠ Tidak ada teks untuk {f.name}")
                 continue
 
-            # Pilih parser sesuai mode
+            years = []
+            report_type_text = raw
+
             if mode == "vision":
-                df = parse_vision_json(raw, num_value_cols=st.session_state.num_value_cols)
-                # Deteksi tahun dari JSON jika ada, fallback ke detect_years
+                df = parse_vision_json(raw, num_value_cols=n_cols)
+                # Tahun dari JSON — sumber paling akurat
                 try:
                     import json as _json
-                    clean = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-                    clean = re.sub(r"\s*```$", "", clean)
-                    data  = _json.loads(clean)
-                    years = data.get("years") or detect_years(raw)
+                    clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+                    jdata = _json.loads(clean)
+                    years = jdata.get("years", [])
+                    # Gunakan keterangan untuk deteksi jenis laporan
+                    report_type_text = " ".join(
+                        r.get("keterangan", "") for r in jdata.get("rows", [])
+                    )
                 except Exception:
-                    years = detect_years(raw)
+                    pass
+                if not years:
+                    n_val = len([c for c in df.columns if c.startswith("Nilai_")])
+                    years = [f"Tahun {i+1}" for i in range(n_val)]
             else:
-                df    = parse_ocr_text(raw, num_value_cols=st.session_state.num_value_cols)
+                df    = parse_ocr_text(raw, num_value_cols=n_cols)
                 years = detect_years(raw)
+                # Sinkronkan years dengan kolom aktual di df
+                n_val = len([c for c in df.columns if c.startswith("Nilai_")])
+                if n_val > len(years):
+                    years = list(years) + [f"Tahun {j+1}" for j in range(len(years), n_val)]
+                elif n_val < len(years):
+                    years = years[:n_val]
 
             st.session_state.ocr_results[f.name] = {
                 "text":  raw,
                 "mode":  mode,
-                "type":  detect_report_type(raw if mode == "ocr" else
-                         " ".join(r.get("keterangan","") for r in
-                                  ([] if mode != "vision" else
-                                   __import__("json").loads(
-                                       re.sub(r"^```(?:json)?\s*|\s*```$","",raw.strip())
-                                   ).get("rows",[])))),
+                "type":  detect_report_type(report_type_text),
                 "years": years,
                 "df":    df,
             }
@@ -2528,127 +2565,206 @@ def render_validation_tab():
         )
 
 
+def _normalize_keterangan(s) -> str:
+    """
+    Normalisasi nama akun untuk pencocokan:
+    - Lowercase
+    - Hapus spasi berlebih
+    - Hapus tanda baca (kecuali tanda hubung dan dalam kurung)
+    - Hapus catatan kaki angka di akhir (misal "Kas 2h,5" → "kas")
+    """
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    t = str(s).lower().strip()
+    # Normalisasi whitespace
+    t = re.sub(r"\s+", " ", t)
+    # Hapus tanda baca di akhir
+    t = re.sub(r"[.,;:]+$", "", t)
+    return t
+
+
+def _extract_year_number(year_str) -> str | None:
+    """
+    Ekstrak HANYA angka tahun dari string yang bisa berbentuk:
+      "2022"               → "2022"
+      "30 Juni 2022"       → "2022"
+      "31 Desember 2021"   → "2021"
+      "Tahun 1"            → None (placeholder)
+
+    Returns: string 4-digit tahun, atau None jika tidak ada.
+    """
+    if year_str is None:
+        return None
+    s = str(year_str).strip()
+    # Cari pola 4-digit tahun (2000-2099)
+    match = re.search(r"\b(20[0-3]\d)\b", s)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _canonical_year(year_str) -> str:
+    """
+    Bentuk kanonik dari string tahun untuk pencocokan dan urutan.
+    "30 Juni 2022" dan "31 Desember 2022" keduanya jadi "2022".
+    Kalau tidak ada tahun terdeteksi, kembalikan string asli (lowercase).
+    """
+    yr = _extract_year_number(year_str)
+    return yr if yr else str(year_str).strip().lower()
+
+
+def _merge_reports_by_account(reports_list: list[dict]) -> dict:
+    """
+    Gabungkan beberapa laporan dengan pendekatan UNION BY ACCOUNT NAME.
+
+    Algoritma (sesuai ide Pak Hendro):
+    1. Kumpulkan SEMUA tahun unik dari semua laporan, normalisasi ke 4-digit
+       (misal "30 Juni 2022" dan "31 Desember 2022" digabung jadi "2022")
+       lalu urutkan menurun (terbaru → terlama).
+    2. Bangun DataFrame kosong dengan kolom = jumlah tahun unik.
+    3. Untuk setiap laporan, untuk setiap baris:
+       a. Cari akun dengan keterangan SAMA (case-insensitive) di tabel master
+       b. Jika ada → isi nilai di kolom tahun yang sesuai
+       c. Jika tidak ada → tambah baris baru di akhir
+
+    Args:
+        reports_list: list of dict dengan keys 'df' dan 'years'
+
+    Returns:
+        {'df': DataFrame gabungan, 'years': list tahun urut menurun}
+    """
+    if not reports_list:
+        return {"df": pd.DataFrame(), "years": []}
+
+    if len(reports_list) == 1:
+        return reports_list[0]
+
+    # ── Langkah 1: kumpulkan semua tahun unik (canonical) ───────────────
+    # canonical_to_display: tahun_kanonik → label tampilan terbaik
+    # contoh: "2022" → "30 Juni 2022" jika ditemukan, atau "2022" jika hanya itu
+    canonical_to_display = {}
+    for r in reports_list:
+        for y in r.get("years", []):
+            canon = _canonical_year(y)
+            display = str(y)
+            if canon not in canonical_to_display:
+                canonical_to_display[canon] = display
+            else:
+                # Pilih label yang lebih lengkap (lebih panjang)
+                if len(display) > len(canonical_to_display[canon]):
+                    canonical_to_display[canon] = display
+
+    # Urutkan tahun: numerik dulu (menurun), placeholder di belakang
+    numeric_canons = sorted(
+        [c for c in canonical_to_display.keys() if c.isdigit()],
+        key=lambda x: int(x), reverse=True,
+    )
+    other_canons = sorted([c for c in canonical_to_display.keys() if not c.isdigit()])
+    master_canons = numeric_canons + other_canons
+    master_years_display = [canonical_to_display[c] for c in master_canons]
+
+    if not master_canons:
+        return reports_list[0]
+
+    n_cols = len(master_canons)
+
+    # ── Langkah 2: bangun struktur master ────────────────────────────────
+    master_rows = []
+    name_index = {}  # norm_keterangan → list of (master_idx, tipe)
+
+    def find_master_idx(norm_key: str, tipe: str) -> int | None:
+        if norm_key not in name_index:
+            return None
+        for idx, t in name_index[norm_key]:
+            if t == tipe:
+                return idx
+        return name_index[norm_key][0][0]
+
+    def add_to_index(norm_key: str, idx: int, tipe: str):
+        name_index.setdefault(norm_key, []).append((idx, tipe))
+
+    # ── Langkah 3: proses setiap laporan ─────────────────────────────────
+    for r in reports_list:
+        df = r["df"]
+        years_in_df = list(r.get("years", []))
+        if df.empty or not years_in_df:
+            continue
+
+        val_cols = [c for c in df.columns if c.startswith("Nilai_")]
+
+        # Mapping: kolom Nilai_X di df → index kolom di master (canonical)
+        col_to_master_idx = {}
+        for col_idx, col_name in enumerate(val_cols):
+            if col_idx < len(years_in_df):
+                yr_canon = _canonical_year(years_in_df[col_idx])
+                if yr_canon in master_canons:
+                    col_to_master_idx[col_name] = master_canons.index(yr_canon)
+
+        # Iterasi setiap baris di df
+        for _, row in df.iterrows():
+            ket   = row.get("Keterangan", "")
+            cat   = row.get("Catatan", "")
+            tipe  = row.get("Tipe", "item")
+            norm  = _normalize_keterangan(ket)
+            if not norm:
+                continue
+
+            existing_idx = find_master_idx(norm, tipe)
+
+            if existing_idx is not None:
+                # Akun sudah ada di master → isi/update kolom yang kosong
+                master_row = master_rows[existing_idx]
+                # Update catatan jika master masih kosong
+                if not master_row.get("Catatan") and cat:
+                    master_row["Catatan"] = cat
+                # Update keterangan jika label di master pendek/UPPERCASE saja
+                # (prefer Title Case dari dokumen lain)
+                cur_ket = master_row.get("Keterangan", "")
+                if cur_ket and cur_ket.isupper() and ket and not ket.isupper():
+                    master_row["Keterangan"] = ket
+
+                for src_col, master_col_idx in col_to_master_idx.items():
+                    new_val = row.get(src_col)
+                    if new_val is None or (isinstance(new_val, float) and pd.isna(new_val)):
+                        continue
+                    target_key = f"Nilai_{master_col_idx + 1}"
+                    existing_val = master_row.get(target_key)
+                    if existing_val is None or (isinstance(existing_val, float) and pd.isna(existing_val)):
+                        master_row[target_key] = new_val
+                    # Jika sudah terisi, biarkan first-wins
+            else:
+                # Akun baru → tambahkan ke master
+                new_row = {
+                    "Tipe":       tipe,
+                    "Keterangan": ket,
+                    "Catatan":    cat or "",
+                }
+                for k in range(n_cols):
+                    new_row[f"Nilai_{k+1}"] = None
+                for src_col, master_col_idx in col_to_master_idx.items():
+                    new_val = row.get(src_col)
+                    if new_val is not None and not (isinstance(new_val, float) and pd.isna(new_val)):
+                        new_row[f"Nilai_{master_col_idx + 1}"] = new_val
+
+                master_rows.append(new_row)
+                add_to_index(norm, len(master_rows) - 1, tipe)
+
+    # ── Langkah 4: bangun DataFrame final ────────────────────────────────
+    if not master_rows:
+        return {"df": pd.DataFrame(), "years": master_years_display}
+
+    cols = ["Tipe", "Keterangan", "Catatan"] + [f"Nilai_{k+1}" for k in range(n_cols)]
+    df_master = pd.DataFrame(master_rows, columns=cols)
+
+    return {"df": df_master, "years": master_years_display}
+
+
 def _merge_reports_horizontal(existing: dict, new_data: dict) -> dict:
     """
-    Gabungkan dua laporan dengan jenis yang sama secara HORIZONTAL.
-
-    Contoh:
-      existing: Nilai_1=2022, Nilai_2=2021  (years=['2022','2021'])
-      new_data: Nilai_1=2021, Nilai_2=2020  (years=['2021','2020'])
-      hasil:    Nilai_1=2022, Nilai_2=2021, Nilai_3=2020
-
-    Strategi (3 tingkat, dari paling akurat ke fallback):
-    1. Match by (Keterangan, nilai_overlap) — paling akurat
-    2. Match by nilai_overlap saja jika nilainya unik secara global
-    3. Match by posisi baris jika panjang sama
+    Wrapper untuk backward compatibility — sekarang menggunakan
+    pendekatan union by account name yang lebih robust.
     """
-    df_exist  = existing["df"].copy()
-    years_ex  = list(existing["years"])
-    df_new    = new_data["df"].copy()
-    years_new = list(new_data["years"])
-
-    years_to_add = [y for y in years_new if y not in years_ex]
-    if not years_to_add:
-        return existing
-
-    # Buat mapping: year → nama kolom baru di df_exist
-    new_col_map = {}
-    for yr in years_to_add:
-        col_name = f"Nilai_{len(years_ex) + 1}"
-        years_ex.append(yr)
-        df_exist[col_name] = None
-        new_col_map[yr] = col_name
-
-    overlap_years = [y for y in years_new if y in existing["years"]]
-
-    if not overlap_years:
-        # Tidak ada overlap → tidak bisa cross-reference, selesai
-        return {"df": df_exist, "years": years_ex}
-
-    overlap_yr = overlap_years[0]
-    ex_overlap_col  = f"Nilai_{existing['years'].index(overlap_yr) + 1}"
-    new_overlap_col = f"Nilai_{years_new.index(overlap_yr) + 1}"
-
-    # ── Strategi 1: match by (Keterangan, nilai_overlap) ─────────────────
-    # Buat lookup dari df_new: (norm_ket, val_overlap) → {col_baru: nilai}
-    def _norm(s):
-        if s is None: return ""
-        return re.sub(r"\s+", " ", str(s).lower().strip())[:60]
-
-    lookup_ket = {}
-    for _, row_n in df_new.iterrows():
-        v_key = row_n.get(new_overlap_col)
-        if v_key is None or (isinstance(v_key, float) and pd.isna(v_key)):
-            continue
-        ket_key = (_norm(row_n.get("Keterangan", "")), v_key)
-        entry = {}
-        for i, yr in enumerate(years_new):
-            if yr in new_col_map:
-                v = row_n.get(f"Nilai_{i+1}")
-                if v is not None and not (isinstance(v, float) and pd.isna(v)):
-                    entry[new_col_map[yr]] = v
-        if entry:
-            lookup_ket[ket_key] = entry
-
-    # ── Strategi 2: match by nilai saja (untuk nilai yang benar-benar unik) ─
-    from collections import defaultdict
-    val_count = defaultdict(int)
-    for _, row_n in df_new.iterrows():
-        v = row_n.get(new_overlap_col)
-        if v is not None and not (isinstance(v, float) and pd.isna(v)):
-            val_count[v] += 1
-
-    lookup_val = {}
-    for _, row_n in df_new.iterrows():
-        v_key = row_n.get(new_overlap_col)
-        if v_key is None or (isinstance(v_key, float) and pd.isna(v_key)):
-            continue
-        if val_count[v_key] != 1:
-            continue  # nilai tidak unik secara global
-        entry = {}
-        for i, yr in enumerate(years_new):
-            if yr in new_col_map:
-                v = row_n.get(f"Nilai_{i+1}")
-                if v is not None and not (isinstance(v, float) and pd.isna(v)):
-                    entry[new_col_map[yr]] = v
-        if entry:
-            lookup_val[v_key] = entry
-
-    # ── Isi df_exist ─────────────────────────────────────────────────────
-    matched_by_ket = 0
-    matched_by_val = 0
-
-    for idx, row_e in df_exist.iterrows():
-        v_key = row_e.get(ex_overlap_col)
-        if v_key is None or (isinstance(v_key, float) and pd.isna(v_key)):
-            continue
-
-        # Coba strategi 1 dulu
-        ket_key = (_norm(row_e.get("Keterangan", "")), v_key)
-        if ket_key in lookup_ket:
-            for col, val in lookup_ket[ket_key].items():
-                df_exist.at[idx, col] = val
-            matched_by_ket += 1
-        # Coba strategi 2
-        elif v_key in lookup_val:
-            for col, val in lookup_val[v_key].items():
-                df_exist.at[idx, col] = val
-            matched_by_val += 1
-
-    # ── Strategi 3: match by posisi jika df panjangnya sama ──────────────
-    # (fallback terakhir untuk laporan yang identik strukturnya)
-    any_new_filled = df_exist[[c for c in df_exist.columns
-                               if c in new_col_map.values()]].notna().any().any()
-    if not any_new_filled and len(df_exist) == len(df_new):
-        for i in range(len(df_exist)):
-            row_n = df_new.iloc[i]
-            for j, yr in enumerate(years_new):
-                if yr in new_col_map:
-                    v = row_n.get(f"Nilai_{j+1}")
-                    if v is not None and not (isinstance(v, float) and pd.isna(v)):
-                        df_exist.at[df_exist.index[i], new_col_map[yr]] = v
-
-    return {"df": df_exist, "years": years_ex}
+    return _merge_reports_by_account([existing, new_data])
 
 
 def render_export_tab():
@@ -2658,46 +2774,31 @@ def render_export_tab():
         st.info("Belum ada data untuk di-export.")
         return
 
-    # ── Gabungkan per jenis laporan ──────────────────────────────────────
-    # Kunci: untuk jenis yang sama, gabung HORIZONTAL (kolom tahun disambung)
-    # bukan vertikal (baris ditumpuk)
-    reports = {}
+    # ── Kumpulkan semua laporan per jenis ─────────────────────────────────
+    # reports_by_type[rtype] = list of {df, years} dari semua sumber
+    # CATATAN: Laporan dengan jenis 'unknown' tetap diproses dan
+    # digabung di sheet 'unknown' supaya Pak Hendro tetap bisa lihat
+    # hasilnya (tidak hilang). Jika ingin disatukan ke neraca/laba_rugi/
+    # arus_kas, edit jenisnya di tab Review.
+    reports_by_type: dict[str, list[dict]] = {}
     for fname, data in st.session_state.ocr_results.items():
-        rtype = data["type"]
-        if rtype == "unknown":
-            continue
-
+        rtype = data["type"] or "unknown"
         entry = {
             "df":    data["df"].copy(),
             "years": list(data["years"]),
+            "source": fname,
         }
+        reports_by_type.setdefault(rtype, []).append(entry)
 
-        if rtype not in reports:
-            reports[rtype] = entry
-        else:
-            # Ada laporan dengan jenis sama → gabung horizontal
-            existing_years = reports[rtype]["years"]
-            new_years      = entry["years"]
-
-            # Cek apakah tahun benar-benar berbeda
-            all_existing = set(str(y) for y in existing_years)
-            all_new      = set(str(y) for y in new_years)
-            unique_new   = all_new - all_existing
-
-            if unique_new:
-                # Ada tahun baru → merge horizontal
-                reports[rtype] = _merge_reports_horizontal(reports[rtype], entry)
-            else:
-                # Tidak ada tahun baru → cukup update DataFrame (mungkin halaman lanjutan)
-                # Gabung vertikal hanya untuk halaman lanjutan laporan yang SAMA
-                reports[rtype]["df"] = pd.concat(
-                    [reports[rtype]["df"], entry["df"]],
-                    ignore_index=True,
-                )
-
-    if not reports:
-        st.warning("Semua laporan berjenis 'unknown'. Set jenisnya di tab Review terlebih dahulu.")
+    if not reports_by_type:
+        st.warning("Belum ada hasil OCR yang bisa di-export.")
         return
+
+    # ── Merge semua laporan per jenis sekaligus (union by account name) ──
+    reports = {}
+    for rtype, entries in reports_by_type.items():
+        merged = _merge_reports_by_account(entries)
+        reports[rtype] = merged
 
     # ── Ringkasan ─────────────────────────────────────────────────────────
     st.markdown("**Ringkasan yang akan di-export:**")
@@ -2706,17 +2807,37 @@ def render_export_tab():
         val_cols = [c for c in d["df"].columns if c.startswith("Nilai_")]
         filled_counts = []
         for vc in val_cols:
-            n = d["df"][vc].notna().sum()
-            filled_counts.append(f"{n}")
+            n = int(d["df"][vc].notna().sum())
+            filled_counts.append(str(n))
+        n_sources = len(reports_by_type[rtype])
         summary.append({
             "Jenis":         rtype,
-            "Jumlah Baris":  len(d["df"]),
+            "Sumber":        f"{n_sources} dokumen",
+            "Total Baris":   len(d["df"]),
             "Tahun":         " | ".join(str(y) for y in d["years"]),
             "Terisi/Kolom":  " | ".join(filled_counts),
         })
     st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
-    # ── Peringatan jika ada kolom kosong ─────────────────────────────────
+    # ── Info detil per kolom ──────────────────────────────────────────────
+    with st.expander("📊 Detail Cakupan per Tahun", expanded=False):
+        for rtype, d in reports.items():
+            st.markdown(f"**{rtype}**")
+            val_cols = [c for c in d["df"].columns if c.startswith("Nilai_")]
+            cov_data = []
+            for i, vc in enumerate(val_cols):
+                yr = d["years"][i] if i < len(d["years"]) else f"Kolom {i+1}"
+                filled = int(d["df"][vc].notna().sum())
+                total = len(d["df"])
+                cov_data.append({
+                    "Tahun":   yr,
+                    "Terisi":  filled,
+                    "Total":   total,
+                    "Persen":  f"{filled/total*100:.0f}%" if total > 0 else "0%",
+                })
+            st.dataframe(pd.DataFrame(cov_data), use_container_width=True, hide_index=True)
+
+    # ── Peringatan kolom kosong (informatif, bukan error) ────────────────
     for rtype, d in reports.items():
         val_cols = [c for c in d["df"].columns if c.startswith("Nilai_")]
         if len(val_cols) >= 2:
@@ -2725,7 +2846,8 @@ def render_export_tab():
             if empty_cols:
                 st.warning(
                     f"⚠ **{rtype}**: kolom tahun **{', '.join(str(y) for y in empty_cols)}** "
-                    f"kosong semua. Pastikan laporan untuk tahun tersebut sudah diproses."
+                    f"kosong. Kemungkinan tidak ada akun yang cocok namanya antara dokumen-dokumen "
+                    f"yang Anda upload. Periksa di tab Review apakah keterangan akun sudah benar."
                 )
 
     if st.button("📥 Generate File Excel", type="primary", use_container_width=True):
