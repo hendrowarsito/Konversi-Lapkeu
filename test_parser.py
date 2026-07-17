@@ -429,5 +429,58 @@ else:
 
 
 print("\n" + "="*70)
+print("TEST 9: _easyocr_layout_to_lines — rekonstruksi baris tabel dari kotak OCR")
+print("="*70)
+
+def box(x, y, w=100, h=20):
+    return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+
+# Simulasi neraca 2 kolom tahun: label kiri, angka 2023 & 2022 di kanan.
+# EasyOCR mengembalikan kotak-kotak ini TIDAK berurutan — kolom label dulu,
+# baru kolom angka (persis penyebab teks paragraf menyatu di laporan asli).
+easyocr_results = [
+    # kolom label (x=50)
+    (box(50, 100),  "ASET", 0.99),
+    (box(50, 130),  "Kas di bank", 0.98),
+    (box(50, 160),  "Piutang usaha", 0.97),
+    (box(50, 190),  "Persediaan", 0.96),
+    (box(50, 220),  "JUMLAH ASET", 0.99),
+    # kolom angka 2023 (x=400) — sedikit beda Y (miring/scan)
+    (box(400, 132), "5,682,551", 0.95),
+    (box(400, 163), "35,748,619", 0.95),
+    (box(400, 189), "14,315,782", 0.95),
+    (box(400, 222), "56,476,939", 0.95),
+    # kolom angka 2022 (x=550)
+    (box(550, 131), "1,477,996", 0.94),
+    (box(550, 161), "19,230,251", 0.94),
+    (box(550, 192), "9,812,237", 0.94),
+    (box(550, 221), "31,080,055", 0.94),
+]
+
+reconstructed = app._easyocr_layout_to_lines(easyocr_results)
+print(reconstructed)
+lines9 = reconstructed.split("\n")
+test("Jumlah baris = 5 (bukan paragraf menyatu)", len(lines9), 5)
+test("Baris 'Kas di bank' utuh dengan kedua angkanya",
+     lines9[1], "Kas di bank  5,682,551  1,477,996")
+test("Baris 'JUMLAH ASET' utuh dengan kedua angkanya",
+     lines9[4], "JUMLAH ASET  56,476,939  31,080,055")
+
+# Pastikan hasil rekonstruksi bisa diparse jadi akun-akun terpisah
+header = "Catatan  2023  2022\n"
+df9 = app.parse_ocr_text(header + reconstructed, num_value_cols=2)
+print()
+print(df9.to_string(index=False))
+labels9 = list(df9["Keterangan"])
+test("'Kas di bank' dikenali sebagai akun", "Kas di bank" in labels9, True)
+test("'Piutang usaha' dikenali sebagai akun", "Piutang usaha" in labels9, True)
+test("'Persediaan' dikenali sebagai akun", "Persediaan" in labels9, True)
+kas9 = df9[df9["Keterangan"] == "Kas di bank"]
+if len(kas9) > 0:
+    test("Kas di bank 2023 = 5.682.551", kas9.iloc[0]["Nilai_1"], 5682551.0)
+    test("Kas di bank 2022 = 1.477.996", kas9.iloc[0]["Nilai_2"], 1477996.0)
+
+
+print("\n" + "="*70)
 print("SELESAI — Semua test algoritma 3-langkah")
 print("="*70)

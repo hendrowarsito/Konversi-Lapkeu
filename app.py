@@ -226,8 +226,9 @@ def ocr_tesseract(image: Image.Image) -> str:
     if not TESSERACT_AVAILABLE:
         return ""
     # PSM 6 = assume uniform block of text (baik untuk tabel)
+    # preserve_interword_spaces = pertahankan jarak antar kolom tabel
     # Bahasa: ind + eng (untuk istilah inggris)
-    config = "--psm 6 -l ind+eng"
+    config = "--psm 6 -l ind+eng -c preserve_interword_spaces=1"
     try:
         return pytesseract.image_to_string(image, config=config)
     except Exception as e:
@@ -235,15 +236,78 @@ def ocr_tesseract(image: Image.Image) -> str:
         return ""
 
 
+def _easyocr_layout_to_lines(results) -> str:
+    """
+    Rekonstruksi baris tabel dari hasil EasyOCR ber-koordinat.
+
+    results: list of (bbox, text, conf) dari reader.readtext(detail=1),
+             bbox = 4 titik [[x,y] kiri-atas, kanan-atas, kanan-bawah, kiri-bawah]
+
+    Kotak-kotak teks dikelompokkan menjadi BARIS berdasarkan tumpang-tindih
+    posisi vertikal (Y), lalu diurutkan kiri→kanan (X) di dalam tiap baris.
+    Dengan begitu label akun dan angka-angkanya yang sejajar di halaman
+    kembali menjadi satu baris teks — struktur tabel tidak hancur.
+    """
+    items = []
+    for res in results:
+        bbox, text = res[0], res[1]
+        if not str(text).strip():
+            continue
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        items.append({
+            "x":  min(xs),
+            "y":  (min(ys) + max(ys)) / 2.0,
+            "h":  max(ys) - min(ys),
+            "text": str(text).strip(),
+        })
+    if not items:
+        return ""
+
+    items.sort(key=lambda it: it["y"])
+
+    # Kelompokkan ke baris: masuk ke baris terdekat jika selisih Y
+    # kurang dari setengah tinggi teks (rata-rata)
+    lines: list[dict] = []
+    for it in items:
+        placed = False
+        for line in lines:
+            tol = max(line["h_avg"], it["h"]) * 0.5
+            if abs(line["y_avg"] - it["y"]) <= tol:
+                line["items"].append(it)
+                n = len(line["items"])
+                line["y_avg"] = (line["y_avg"] * (n - 1) + it["y"]) / n
+                line["h_avg"] = (line["h_avg"] * (n - 1) + it["h"]) / n
+                placed = True
+                break
+        if not placed:
+            lines.append({"y_avg": it["y"], "h_avg": it["h"], "items": [it]})
+
+    lines.sort(key=lambda l: l["y_avg"])
+    out = []
+    for line in lines:
+        line["items"].sort(key=lambda it: it["x"])
+        out.append("  ".join(it["text"] for it in line["items"]))
+    return "\n".join(out)
+
+
 def ocr_easyocr(image: Image.Image) -> str:
-    """OCR dengan EasyOCR sebagai fallback."""
+    """
+    OCR dengan EasyOCR sebagai fallback.
+
+    PENTING: paragraph=False + detail=1 (dengan koordinat), lalu baris
+    direkonstruksi dari posisi kotak teks. Mode paragraph=True yang lama
+    MELEBUR kolom label dan kolom angka tabel menjadi paragraf — nama-nama
+    akun menyatu di satu baris dan angkanya bergerombol terpisah, sehingga
+    tidak bisa dimaknai sebagai akun oleh parser.
+    """
     reader = get_easyocr_reader()
     if reader is None:
         return ""
     try:
         img_array = np.array(image)
-        results = reader.readtext(img_array, detail=0, paragraph=True)
-        return "\n".join(results)
+        results = reader.readtext(img_array, detail=1, paragraph=False)
+        return _easyocr_layout_to_lines(results)
     except Exception as e:
         st.warning(f"EasyOCR gagal: {e}")
         return ""
@@ -594,9 +658,11 @@ def _clean_label(raw: str) -> str:
     # Jika ALL CAPS → kemungkinan section/total header, jangan dipotong
     if t.isupper():
         return re.sub(r"\s+", " ", t)
-    # Hapus trailing nomor catatan: pola spasi + angka/huruf pendek di akhir
-    # Contoh: '  4,33' | '  19a' | '  32' | '  12,14,33'
-    cleaned = re.sub(r"\s+[\d,;a-z]{1,12}\s*$", "", t, flags=re.IGNORECASE)
+    # Hapus trailing nomor catatan: token akhir yang DIAWALI ANGKA
+    # Contoh: '  4,33' | '  19a' | '  32' | '  12,14,33' | '  2h,5'
+    # Kata biasa TIDAK dipotong — dulu pola [\d,;a-z]{1,12} juga memakan
+    # kata terakhir label ('Kas di bank' → 'Kas di').
+    cleaned = re.sub(r"\s+\d[\d,;.a-z]{0,11}\s*$", "", t, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned if cleaned else t
 
