@@ -3,11 +3,14 @@ Test unit untuk komponen inti parser (tanpa perlu jalankan Streamlit).
 Jalankan: python test_parser.py
 """
 import sys
-sys.path.insert(0, '/home/claude')
+from pathlib import Path
+
+_APP_PATH = Path(__file__).resolve().parent / "app.py"
+sys.path.insert(0, str(_APP_PATH.parent))
 
 # Import functions tanpa trigger streamlit UI
 import importlib.util
-spec = importlib.util.spec_from_file_location("app_module", "/home/claude/app.py")
+spec = importlib.util.spec_from_file_location("app_module", str(_APP_PATH))
 
 # Patch streamlit agar tidak error saat import
 import types

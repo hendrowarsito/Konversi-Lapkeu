@@ -1088,7 +1088,9 @@ def build_excel(
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
     left_indent = Alignment(horizontal="left", vertical="center", indent=1, wrap_text=True)
 
-    NUM_FMT = '#,##0;(#,##0);"-"'
+    # Format angka: ribuan dengan koma, negatif dalam kurung, nol tampil "0"
+    # (akun yang tidak ada di suatu tahun diisi 0 dan harus terlihat sebagai 0)
+    NUM_FMT = '#,##0;(#,##0);0'
 
     # Sheet Info
     ws_info = wb.create_sheet("Info")
@@ -2565,22 +2567,35 @@ def render_validation_tab():
         )
 
 
+# Sinonim istilah akuntansi lama ↔ baru, supaya akun yang sama dengan
+# penamaan berbeda antar tahun tetap dikenali sebagai satu akun.
+_ACCOUNT_SYNONYMS = {
+    "aktiva":    "aset",
+    "kewajiban": "liabilitas",
+    "hutang":    "utang",
+}
+
+
 def _normalize_keterangan(s) -> str:
     """
-    Normalisasi nama akun untuk pencocokan:
-    - Lowercase
-    - Hapus spasi berlebih
-    - Hapus tanda baca (kecuali tanda hubung dan dalam kurung)
-    - Hapus catatan kaki angka di akhir (misal "Kas 2h,5" → "kas")
+    Normalisasi nama akun untuk pencocokan antar tahun/dokumen:
+    - Lowercase & rapikan spasi
+    - Semua tanda baca dianggap spasi → "Piutang lain-lain" == "Piutang lain lain"
+    - Buang token nomor catatan berpola angka+huruf di akhir ("Kas 2h" → "kas")
+    - Samakan sinonim istilah lama/baru (aktiva→aset, kewajiban→liabilitas, dst.)
     """
     if s is None or (isinstance(s, float) and pd.isna(s)):
         return ""
     t = str(s).lower().strip()
-    # Normalisasi whitespace
-    t = re.sub(r"\s+", " ", t)
-    # Hapus tanda baca di akhir
-    t = re.sub(r"[.,;:]+$", "", t)
-    return t
+    # Semua non-alfanumerik jadi spasi (tanda hubung, koma, kurung, dll.)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    words = [_ACCOUNT_SYNONYMS.get(w, w) for w in t.split()]
+    # Buang trailing token nomor catatan berpola digit+huruf (mis. '2h', '12a').
+    # Token angka murni TIDAK dibuang agar akun seperti "PPh pasal 21" vs
+    # "PPh pasal 25" tidak salah tergabung.
+    while len(words) > 1 and re.fullmatch(r"\d{1,3}[a-z]", words[-1]):
+        words.pop()
+    return " ".join(words)
 
 
 def _extract_year_number(year_str) -> str | None:
@@ -2618,14 +2633,21 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
     Gabungkan beberapa laporan dengan pendekatan UNION BY ACCOUNT NAME.
 
     Algoritma (sesuai ide Pak Hendro):
-    1. Kumpulkan SEMUA tahun unik dari semua laporan, normalisasi ke 4-digit
+    1. Urutkan dokumen dari tahun TERBARU → struktur/urutan akun mengikuti
+       laporan terbaru (mis. neraca 2025 jadi kerangka utama).
+    2. Kumpulkan SEMUA tahun unik dari semua laporan, normalisasi ke 4-digit
        (misal "30 Juni 2022" dan "31 Desember 2022" digabung jadi "2022")
        lalu urutkan menurun (terbaru → terlama).
-    2. Bangun DataFrame kosong dengan kolom = jumlah tahun unik.
     3. Untuk setiap laporan, untuk setiap baris:
-       a. Cari akun dengan keterangan SAMA (case-insensitive) di tabel master
+       a. Cari akun dengan keterangan sama (dinormalisasi, per-section)
+          di tabel master
        b. Jika ada → isi nilai di kolom tahun yang sesuai
-       c. Jika tidak ada → tambah baris baru di akhir
+       c. Jika tidak ada → SISIPKAN baris baru tepat setelah baris terakhir
+          yang cocok, sehingga akun tetap berada di dalam section-nya
+          (bukan ditumpuk di akhir tabel).
+
+    Akun yang tidak ada di suatu tahun bernilai None di kolom tahun itu —
+    gunakan _fill_missing_values_with_zero() untuk mengisinya dengan 0.
 
     Args:
         reports_list: list of dict dengan keys 'df' dan 'years'
@@ -2633,17 +2655,29 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
     Returns:
         {'df': DataFrame gabungan, 'years': list tahun urut menurun}
     """
+    reports_list = [r for r in reports_list if r and r.get("df") is not None]
     if not reports_list:
         return {"df": pd.DataFrame(), "years": []}
 
     if len(reports_list) == 1:
         return reports_list[0]
 
-    # ── Langkah 1: kumpulkan semua tahun unik (canonical) ───────────────
+    # ── Langkah 1: dokumen tahun terbaru diproses lebih dulu ─────────────
+    def _newest_year(r) -> int:
+        yrs = []
+        for y in r.get("years", []):
+            n = _extract_year_number(y)
+            if n:
+                yrs.append(int(n))
+        return max(yrs) if yrs else -1
+
+    reports_sorted = sorted(reports_list, key=_newest_year, reverse=True)
+
+    # ── Langkah 2: kumpulkan semua tahun unik (canonical) ───────────────
     # canonical_to_display: tahun_kanonik → label tampilan terbaik
     # contoh: "2022" → "30 Juni 2022" jika ditemukan, atau "2022" jika hanya itu
     canonical_to_display = {}
-    for r in reports_list:
+    for r in reports_sorted:
         for y in r.get("years", []):
             canon = _canonical_year(y)
             display = str(y)
@@ -2664,27 +2698,53 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
     master_years_display = [canonical_to_display[c] for c in master_canons]
 
     if not master_canons:
-        return reports_list[0]
+        return reports_sorted[0]
 
     n_cols = len(master_canons)
 
-    # ── Langkah 2: bangun struktur master ────────────────────────────────
+    # ── Struktur master + dua indeks pencarian ───────────────────────────
+    # key_index : (section_norm, akun_norm) → list of (master_idx, tipe)
+    #             Pencocokan per-section supaya akun bernama sama di section
+    #             berbeda (mis. "Lainnya" di Aset dan di Liabilitas) tidak
+    #             salah tergabung.
+    # norm_index: akun_norm → list of (master_idx, tipe)
+    #             Fallback global — hanya dipakai jika nama akun UNIK,
+    #             untuk kasus section header gagal terdeteksi di salah satu
+    #             dokumen (perbedaan hasil OCR).
     master_rows = []
-    name_index = {}  # norm_keterangan → list of (master_idx, tipe)
+    key_index: dict = {}
+    norm_index: dict = {}
 
-    def find_master_idx(norm_key: str, tipe: str) -> int | None:
-        if norm_key not in name_index:
-            return None
-        for idx, t in name_index[norm_key]:
+    def _shift_index(index: dict, insert_pos: int):
+        """Geser semua master_idx >= insert_pos setelah penyisipan baris."""
+        for k in index:
+            index[k] = [(i + 1 if i >= insert_pos else i, t) for i, t in index[k]]
+
+    def find_master_idx(key, norm: str, tipe: str, used_this_doc: set) -> int | None:
+        # Baris master yang sudah dipakai dokumen ini tidak boleh dipakai lagi:
+        # dua baris berbeda dalam SATU dokumen harus tetap jadi dua baris.
+        entries = [(i, t) for i, t in key_index.get(key, []) if i not in used_this_doc]
+        # Prioritas 1: tipe sama persis
+        for idx, t in entries:
             if t == tipe:
                 return idx
-        return name_index[norm_key][0][0]
-
-    def add_to_index(norm_key: str, idx: int, tipe: str):
-        name_index.setdefault(norm_key, []).append((idx, tipe))
+        if tipe == "section":
+            return None  # section hanya boleh match dengan section
+        # Prioritas 2: tipe beda tapi bukan section (item ↔ total)
+        for idx, t in entries:
+            if t != "section":
+                return idx
+        # Prioritas 3 (fallback global): nama akun unik di seluruh master —
+        # untuk kasus section header gagal terdeteksi di salah satu dokumen
+        global_entries = [(i, t) for i, t in norm_index.get(norm, [])
+                          if t != "section" and i not in used_this_doc]
+        unique_idxs = {i for i, _ in global_entries}
+        if len(unique_idxs) == 1:
+            return next(iter(unique_idxs))
+        return None
 
     # ── Langkah 3: proses setiap laporan ─────────────────────────────────
-    for r in reports_list:
+    for r in reports_sorted:
         df = r["df"]
         years_in_df = list(r.get("years", []))
         if df.empty or not years_in_df:
@@ -2700,16 +2760,26 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
                 if yr_canon in master_canons:
                     col_to_master_idx[col_name] = master_canons.index(yr_canon)
 
+        cur_section = ""     # section aktif saat menyusuri baris dokumen ini
+        last_pos = -1        # posisi baris master terakhir yang cocok (anchor)
+        used_this_doc = set()  # baris master yang sudah di-klaim dokumen ini
+
         # Iterasi setiap baris di df
         for _, row in df.iterrows():
             ket   = row.get("Keterangan", "")
             cat   = row.get("Catatan", "")
-            tipe  = row.get("Tipe", "item")
+            tipe  = row.get("Tipe", "item") or "item"
             norm  = _normalize_keterangan(ket)
             if not norm:
                 continue
 
-            existing_idx = find_master_idx(norm, tipe)
+            if tipe == "section":
+                key = ("__section__", norm)
+                cur_section = norm
+            else:
+                key = (cur_section, norm)
+
+            existing_idx = find_master_idx(key, norm, tipe, used_this_doc)
 
             if existing_idx is not None:
                 # Akun sudah ada di master → isi/update kolom yang kosong
@@ -2720,7 +2790,7 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
                 # Update keterangan jika label di master pendek/UPPERCASE saja
                 # (prefer Title Case dari dokumen lain)
                 cur_ket = master_row.get("Keterangan", "")
-                if cur_ket and cur_ket.isupper() and ket and not ket.isupper():
+                if cur_ket and cur_ket.isupper() and ket and not str(ket).isupper():
                     master_row["Keterangan"] = ket
 
                 for src_col, master_col_idx in col_to_master_idx.items():
@@ -2731,9 +2801,12 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
                     existing_val = master_row.get(target_key)
                     if existing_val is None or (isinstance(existing_val, float) and pd.isna(existing_val)):
                         master_row[target_key] = new_val
-                    # Jika sudah terisi, biarkan first-wins
+                    # Jika sudah terisi, biarkan first-wins (dokumen terbaru menang)
+                last_pos = existing_idx
+                used_this_doc.add(existing_idx)
             else:
-                # Akun baru → tambahkan ke master
+                # Akun baru → SISIPKAN setelah anchor terakhir supaya tetap
+                # berada di posisi section yang benar (bukan di akhir tabel)
                 new_row = {
                     "Tipe":       tipe,
                     "Keterangan": ket,
@@ -2746,8 +2819,15 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
                     if new_val is not None and not (isinstance(new_val, float) and pd.isna(new_val)):
                         new_row[f"Nilai_{master_col_idx + 1}"] = new_val
 
-                master_rows.append(new_row)
-                add_to_index(norm, len(master_rows) - 1, tipe)
+                insert_pos = last_pos + 1
+                master_rows.insert(insert_pos, new_row)
+                _shift_index(key_index, insert_pos)
+                _shift_index(norm_index, insert_pos)
+                used_this_doc = {i + 1 if i >= insert_pos else i for i in used_this_doc}
+                key_index.setdefault(key, []).append((insert_pos, tipe))
+                norm_index.setdefault(norm, []).append((insert_pos, tipe))
+                last_pos = insert_pos
+                used_this_doc.add(insert_pos)
 
     # ── Langkah 4: bangun DataFrame final ────────────────────────────────
     if not master_rows:
@@ -2757,6 +2837,32 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
     df_master = pd.DataFrame(master_rows, columns=cols)
 
     return {"df": df_master, "years": master_years_display}
+
+
+def _fill_missing_values_with_zero(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Isi nilai kosong (None/NaN) dengan 0 pada baris 'item' dan 'total'.
+
+    Ini mewujudkan aturan: akun yang tidak ada di suatu tahun tetap
+    ditampilkan di laporan gabungan dengan nilai 0 untuk tahun tersebut
+    (mis. "Piutang lain-lain" hanya ada di 2025 → kolom 2024 diisi 0).
+
+    Baris 'section' (judul kelompok) dibiarkan kosong.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    val_cols = [c for c in df.columns if c.startswith("Nilai_")]
+    if not val_cols:
+        return df
+    if "Tipe" in df.columns:
+        mask = df["Tipe"].isin(["item", "total"])
+    else:
+        mask = pd.Series(True, index=df.index)
+    for c in val_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df.loc[mask & df[c].isna(), c] = 0
+    return df
 
 
 def _merge_reports_horizontal(existing: dict, new_data: dict) -> dict:
@@ -2795,15 +2901,30 @@ def render_export_tab():
         return
 
     # ── Merge semua laporan per jenis sekaligus (union by account name) ──
-    reports = {}
+    reports_raw = {}
     for rtype, entries in reports_by_type.items():
         merged = _merge_reports_by_account(entries)
-        reports[rtype] = merged
+        reports_raw[rtype] = merged
 
-    # ── Ringkasan ─────────────────────────────────────────────────────────
+    # ── Opsi: isi akun yang tidak ada di suatu tahun dengan 0 ────────────
+    fill_zero = st.checkbox(
+        "Isi akun yang tidak ada di suatu tahun dengan angka 0",
+        value=True,
+        help="Contoh: 'Piutang lain-lain' hanya ada di neraca 2025 → "
+             "pada kolom 2024 diisi 0 (bukan dikosongkan). "
+             "Baris section (judul kelompok) tetap kosong.",
+    )
+
+    reports = {}
+    for rtype, d in reports_raw.items():
+        df_out = _fill_missing_values_with_zero(d["df"]) if fill_zero else d["df"]
+        reports[rtype] = {"df": df_out, "years": d["years"]}
+
+    # ── Ringkasan (dihitung dari data SEBELUM diisi 0, agar cakupan
+    #    per tahun tetap menggambarkan data asli hasil ekstraksi) ─────────
     st.markdown("**Ringkasan yang akan di-export:**")
     summary = []
-    for rtype, d in reports.items():
+    for rtype, d in reports_raw.items():
         val_cols = [c for c in d["df"].columns if c.startswith("Nilai_")]
         filled_counts = []
         for vc in val_cols:
@@ -2819,9 +2940,28 @@ def render_export_tab():
         })
     st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
+    # ── Preview hasil gabungan (persis seperti yang akan di-export) ─────
+    with st.expander("👀 Preview Hasil Gabungan Multi-Tahun", expanded=False):
+        st.caption(
+            "Semua akun dari semua tahun digabung. Akun yang tidak ada di "
+            "suatu tahun " +
+            ("diisi **0**." if fill_zero else "dibiarkan **kosong**.")
+        )
+        for rtype, d in reports.items():
+            st.markdown(f"**{rtype}** — tahun: {', '.join(str(y) for y in d['years'])}")
+            df_prev = d["df"].copy()
+            # Ganti nama kolom Nilai_X → label tahun agar mudah dibaca
+            rename_map = {}
+            for i, y in enumerate(d["years"]):
+                col = f"Nilai_{i+1}"
+                if col in df_prev.columns:
+                    rename_map[col] = str(y)
+            df_prev = df_prev.rename(columns=rename_map)
+            st.dataframe(df_prev, use_container_width=True, hide_index=True)
+
     # ── Info detil per kolom ──────────────────────────────────────────────
     with st.expander("📊 Detail Cakupan per Tahun", expanded=False):
-        for rtype, d in reports.items():
+        for rtype, d in reports_raw.items():
             st.markdown(f"**{rtype}**")
             val_cols = [c for c in d["df"].columns if c.startswith("Nilai_")]
             cov_data = []
@@ -2838,7 +2978,7 @@ def render_export_tab():
             st.dataframe(pd.DataFrame(cov_data), use_container_width=True, hide_index=True)
 
     # ── Peringatan kolom kosong (informatif, bukan error) ────────────────
-    for rtype, d in reports.items():
+    for rtype, d in reports_raw.items():
         val_cols = [c for c in d["df"].columns if c.startswith("Nilai_")]
         if len(val_cols) >= 2:
             empty_cols = [d["years"][i] for i, vc in enumerate(val_cols)
