@@ -17,6 +17,7 @@ import pandas as pd
 import numpy as np
 import re
 import io
+import difflib
 import base64
 import json
 from pathlib import Path
@@ -606,10 +607,26 @@ _PAT_YEAR  = re.compile(r"\b20[0-3]\d\b")
 _PAT_NOTES = re.compile(r"^\s*[\d,a-z]{1,10}\s*$", re.IGNORECASE)
 
 
+# Nama section yang lazim di laporan keuangan Indonesia, dalam bentuk
+# ternormalisasi (sinonim aktiva→aset, kewajiban→liabilitas sudah diterapkan).
+# Dipakai untuk mengenali judul section yang TIDAK ditulis ALL CAPS
+# (mis. 'Aset lancar', 'Liabilitas jangka pendek' dicetak bold biasa).
+_KNOWN_SECTION_NAMES = {
+    "aset", "aset lancar", "aset tidak lancar",
+    "liabilitas", "liabilitas jangka pendek", "liabilitas jangka panjang",
+    "liabilitas lancar", "liabilitas tidak lancar",
+    "ekuitas", "pendapatan", "beban", "beban usaha",
+    "arus kas dari aktivitas operasi", "arus kas dari aktivitas investasi",
+    "arus kas dari aktivitas pendanaan",
+}
+
+
 def _is_section_header(line: str) -> bool:
     """
-    True jika baris adalah judul section murni:
-    ALL CAPS, tidak mengandung angka keuangan (≥7 digit).
+    True jika baris adalah judul section murni (tanpa angka keuangan):
+    - ALL CAPS ('ASET', 'LIABILITAS'), atau
+    - Nama section umum laporan keuangan meski huruf besar-kecil
+      ('Aset lancar', 'Liabilitas jangka pendek').
 
     Catatan: baris seperti 'LABA BERSIH 360,724,480 366,412,599'
     BUKAN section header — mengandung angka → False.
@@ -620,23 +637,90 @@ def _is_section_header(line: str) -> bool:
     # Jika ada angka keuangan → bukan pure section header
     if _PAT_FINANCIAL_NUM.search(t):
         return False
-    # Harus ALL CAPS (huruf semua kapital), minimal 3 karakter
+    # ALL CAPS (huruf semua kapital), minimal 3 karakter
     # isupper() True hanya jika ada setidaknya satu huruf dan semua huruf kapital
-    return t.isupper() and len(t) >= 3 and not t.isdigit()
+    if t.isupper() and len(t) >= 3 and not t.isdigit():
+        return True
+    # Judul section umum meski Title Case (dicetak bold di laporan asli)
+    return _normalize_keterangan(t) in _KNOWN_SECTION_NAMES
+
+
+def _is_narrative_number(line: str, m: re.Match) -> bool:
+    """
+    True jika angka ini bagian dari NARASI, bukan nilai akun.
+    Contoh umum di laporan keuangan Indonesia (keterangan modal saham):
+      'Modal saham - 255.750 lembar modal dasar ...'
+      '... dengan nilai nominal Rp 100.000 (satuan penuh) per lembar'
+      '(2022: 50.000 lembar modal dasar ...)'
+    """
+    before = line[:m.start()].rstrip()
+    after  = line[m.end():].lstrip()
+    # Didahului 'Rp' atau ':' → nominal narasi, bukan nilai kolom
+    if before.endswith(("Rp", "Rp.", ":")):
+        return True
+    # Diikuti kata narasi khas modal saham
+    if re.match(r"(?:lembar|saham|\(satuan)\b", after, flags=re.IGNORECASE):
+        return True
+    return False
 
 
 def _extract_financial_numbers(line: str) -> list[float]:
     """
     Ekstrak semua angka keuangan dari satu baris.
     Filter: nilai absolut >= 1000 (menghindari nomor catatan, tahun, dll.)
+    dan bukan angka narasi (jumlah lembar saham, nominal Rp per lembar).
     """
     results = []
     for m in _PAT_FINANCIAL_NUM.finditer(line):
-        raw = m.group()
-        val = parse_indonesian_number(raw)
+        if _is_narrative_number(line, m):
+            continue
+        val = parse_indonesian_number(m.group())
         if val is not None and abs(val) >= 1000:
             results.append(val)
     return results
+
+
+def _extract_value_tokens(line: str) -> list[float]:
+    """
+    Ekstrak nilai kolom dari satu baris DENGAN memperhitungkan tanda '-'
+    sebagai nilai nihil (0), sesuai konvensi laporan keuangan.
+
+    Contoh: 'Pajak dibayar di muka  -  9a  1,544'
+      → [0.0, 1544.0]  (nilai tahun pertama nihil, tahun kedua 1.544)
+    Tanpa ini, 1.544 akan bergeser ke kolom tahun yang salah.
+
+    Tanda '-' hanya dihitung jika berdiri sendiri (diapit spasi) dan
+    token setelahnya berupa angka/nomor catatan/akhir baris — supaya
+    tanda hubung pada nama akun ('Piutang usaha - pihak ketiga')
+    tidak ikut terhitung.
+    """
+    tokens: list[tuple[int, float]] = []  # (posisi, nilai)
+    for m in _PAT_FINANCIAL_NUM.finditer(line):
+        if _is_narrative_number(line, m):
+            continue
+        val = parse_indonesian_number(m.group())
+        if val is not None and abs(val) >= 1000:
+            tokens.append((m.start(), val))
+
+    if not tokens:
+        return []
+
+    # Cari '-' berdiri sendiri sebagai nilai nihil
+    for m in re.finditer(r"(?<=\s)-(?=\s|$)", line):
+        rest = line[m.end():].lstrip()
+        next_tok = rest.split()[0] if rest.split() else ""
+        # Setelah '-' harus angka, nomor catatan pendek, '-' lain, atau akhir baris
+        is_nil = (
+            not next_tok
+            or next_tok == "-"
+            or _PAT_FINANCIAL_NUM.match(next_tok)
+            or re.fullmatch(r"\d{1,2}[a-z]?", next_tok, flags=re.IGNORECASE)
+        )
+        if is_nil:
+            tokens.append((m.start(), 0.0))
+
+    tokens.sort(key=lambda t: t[0])
+    return [v for _, v in tokens]
 
 
 def _label_before_numbers(line: str) -> str:
@@ -655,14 +739,19 @@ def _clean_label(raw: str) -> str:
     - Normalisasi spasi
     """
     t = raw.strip()
-    # Jika ALL CAPS → kemungkinan section/total header, jangan dipotong
+    # Jika ALL CAPS → kemungkinan section/total header. Kata-katanya jangan
+    # dipotong, tapi buang pecahan angka/tanda baca yang bocor di akhir
+    # (mis. 'JUMLAH ASET 56' dari 'JUMLAH ASET 56 476,939' yang rusak OCR)
     if t.isupper():
+        t = re.sub(r"[\s\d.,()'\"`?@*_|-]+$", "", t).strip() or t
         return re.sub(r"\s+", " ", t)
     # Hapus trailing nomor catatan: token akhir yang DIAWALI ANGKA
     # Contoh: '  4,33' | '  19a' | '  32' | '  12,14,33' | '  2h,5'
     # Kata biasa TIDAK dipotong — dulu pola [\d,;a-z]{1,12} juga memakan
     # kata terakhir label ('Kas di bank' → 'Kas di').
     cleaned = re.sub(r"\s+\d[\d,;.a-z]{0,11}\s*$", "", t, flags=re.IGNORECASE)
+    # Hapus tanda '-' nilai nihil yang tersisa di ujung label
+    cleaned = re.sub(r"\s+-\s*$", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned if cleaned else t
 
@@ -877,7 +966,12 @@ def reconstruct_labels(
                 if i - j > 6:
                     break                               # terlalu jauh
                 if _is_section_header(prev):
-                    break                               # ALL CAPS tanpa angka → stop
+                    # Judul 'JUMLAH .../TOTAL ...' yang terpotong baris
+                    # (mis. 'JUMLAH LIABILITAS DAN' ← 'EKUITAS 89,916,817')
+                    # adalah bagian label total ini, bukan section
+                    if any(kw in prev.lower() for kw in ("jumlah", "total")):
+                        continuation_parts.insert(0, prev)
+                    break                               # section murni → stop
                 if _extract_financial_numbers(prev_raw):
                     break                               # baris berAngka lain → stop
                 if _PAT_NOTES.match(prev):
@@ -886,6 +980,14 @@ def reconstruct_labels(
 
                 # Jika baris atas jelas lanjutan kalimat → gabung
                 if _is_continuation(prev):
+                    continuation_parts.insert(0, prev)
+                    j -= 1
+                    continue
+
+                # Baris berawalan '(' = sambungan keterangan naratif
+                # (mis. '(satuan penuh) per lembar' pada narasi modal saham)
+                # → gabung dan terus rangkai ke atas
+                if prev.startswith("("):
                     continuation_parts.insert(0, prev)
                     j -= 1
                     continue
@@ -908,7 +1010,11 @@ def reconstruct_labels(
             while j >= safe_start:
                 prev_raw = lines[j]
                 prev     = prev_raw.strip()
-                if not prev or _is_section_header(prev):
+                if not prev:
+                    break
+                if _is_section_header(prev):
+                    if any(kw in prev.lower() for kw in ("jumlah", "total")):
+                        continuation_parts.insert(0, prev)
                     break
                 if _extract_financial_numbers(prev_raw):
                     break
@@ -933,7 +1039,7 @@ def reconstruct_labels(
 
         # Baris tanpa label bermakna (hanya angka/tanda baca) — biasanya
         # angka yatim dari layout dwibahasa/dua kolom hasil OCR.
-        if re.fullmatch(r"[\d.,()\-\s%]*", label):
+        if re.fullmatch(r"[\d.,()\-\s%'\"`?@*_|=]*", label):
             # Pola umum laporan dwibahasa: label total di satu baris
             # ("JUMLAH ASET"), nilainya di baris berikutnya. Tempelkan
             # angka yatim ke baris total/jumlah di atasnya yang masih
@@ -960,8 +1066,22 @@ def reconstruct_labels(
         # Catatan ada di TENGAH (bukan awal), tapi OCR kadang
         # meletakkannya setelah label atau di antara dua nilai.
         # Heuristik: jika ada angka kecil (abs ≤ 100) di antara dua angka besar
-        values = nums.copy()
+        # _extract_value_tokens juga mengenali '-' sebagai nilai nihil (0)
+        values = _extract_value_tokens(line)
+        if not values:
+            values = nums.copy()
         catatan = ""
+
+        # Nomor catatan di TENGAH antara dua nilai (layout: 2024 | Catatan | 2023)
+        all_num_matches = list(_PAT_FINANCIAL_NUM.finditer(line))
+        if len(all_num_matches) >= 2:
+            between = line[all_num_matches[0].end():all_num_matches[-1].start()]
+            m_note = re.fullmatch(
+                r"\s*(\d{1,2}[a-z]?(?:\s*[,;]\s*\d{1,2}[a-z]?)*)\s*",
+                between, flags=re.IGNORECASE,
+            )
+            if m_note:
+                catatan = m_note.group(1).replace(" ", "")
 
         if len(values) > num_value_cols:
             # Cari angka kecil yang mungkin adalah nomor catatan
@@ -969,7 +1089,8 @@ def reconstruct_labels(
             filtered = []
             cat_candidates = []
             for v in values:
-                if abs(v) <= 100:
+                # 0 adalah nilai nihil ('-') yang sah, bukan nomor catatan
+                if v != 0 and abs(v) <= 100:
                     cat_candidates.append(str(int(v)) if v == int(v) else str(v))
                 else:
                     filtered.append(v)
@@ -988,6 +1109,13 @@ def reconstruct_labels(
 
         # ── Klasifikasi tipe ──────────────────────────────────────────────
         row_type = _classify_row(label)
+
+        # Jika label ini menyerap judul 'JUMLAH/TOTAL ...' dari baris atas,
+        # hapus baris section duplikat yang terlanjur ditambahkan sebelumnya
+        for part in continuation_parts:
+            if rows and rows[-1]["Tipe"] == "section" \
+               and rows[-1]["Keterangan"] == part:
+                rows.pop()
 
         rows.append({
             "Tipe":       row_type,
@@ -1023,6 +1151,12 @@ def _preclean_ocr_line(line: str) -> str:
     line = re.sub(r"(?<=\d)[.,]{2,}(?=\d)", ",", line)
     # Spasi setelah pemisah ribuan di dalam angka
     line = re.sub(r"(?<=\d)([.,])\s+(?=\d{3}(?:\D|$))", r"\1", line)
+    # Pemisah ribuan yang hilang jadi spasi: '5,682 551' → '5,682,551'
+    # Syarat ketat: sebelum spasi ada grup ribuan utuh ([.,]ddd) dan
+    # setelahnya TEPAT 3 digit yang bukan awal angka lain (tidak diikuti
+    # digit/pemisah) — supaya dua nilai kolom berdampingan
+    # ('158,259 123,208') TIDAK tergabung.
+    line = re.sub(r"(?<=[.,]\d{3}) (?=\d{3}(?![\d.,]))", ",", line)
 
     def _fix_token(m: re.Match) -> str:
         tok = m.group(0)
@@ -2718,7 +2852,32 @@ def _normalize_keterangan(s) -> str:
     # "PPh pasal 25" tidak salah tergabung.
     while len(words) > 1 and re.fullmatch(r"\d{1,3}[a-z]", words[-1]):
         words.pop()
-    return " ".join(words)
+    result = " ".join(words)
+    # 'lain lain' dan 'lainnya' adalah ejaan berbeda untuk akun yang sama
+    # (mis. 'Aset lancar lain-lain' di laporan 2024 vs 'Aset lancar lainnya'
+    # di laporan 2023)
+    result = re.sub(r"\blain lain\b", "lainnya", result)
+    return result
+
+
+# Kata sambung yang diabaikan saat pencocokan urutan-kata
+_MATCH_STOPWORDS = {"dari", "dan", "yang"}
+
+
+def _match_aux_keys(norm: str) -> tuple[str, str | None]:
+    """
+    Kunci pencocokan tambahan dari nama akun ternormalisasi:
+    - skey: kata-kata diurutkan alfabetis (tanpa kata sambung) → mencocokkan
+      'Bagian jangka pendek dari liabilitas sewa' dengan
+      'Liabilitas sewa bagian jangka pendek' (urutan kata beda).
+    - pkey: 6 kata pertama (hanya untuk label panjang >6 kata) → mencocokkan
+      keterangan naratif panjang (mis. modal saham) yang ekornya berbeda
+      antar tahun.
+    """
+    words = norm.split()
+    skey = " ".join(sorted(w for w in words if w not in _MATCH_STOPWORDS))
+    pkey = " ".join(words[:6]) if len(words) > 6 else None
+    return skey, pkey
 
 
 def _extract_year_number(year_str) -> str | None:
@@ -2834,9 +2993,13 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
     #             Fallback global — hanya dipakai jika nama akun UNIK,
     #             untuk kasus section header gagal terdeteksi di salah satu
     #             dokumen (perbedaan hasil OCR).
+    # sorted_index / prefix_index: kunci tambahan (lihat _match_aux_keys)
+    #             untuk urutan kata berbeda dan label naratif panjang.
     master_rows = []
     key_index: dict = {}
     norm_index: dict = {}
+    sorted_index: dict = {}
+    prefix_index: dict = {}
 
     def _shift_index(index: dict, insert_pos: int):
         """Geser semua master_idx >= insert_pos setelah penyisipan baris."""
@@ -2864,6 +3027,34 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
         unique_idxs = {i for i, _ in global_entries}
         if len(unique_idxs) == 1:
             return next(iter(unique_idxs))
+        if unique_idxs:
+            return None  # nama sama muncul di beberapa tempat — ambigu, jangan tebak
+
+        # Prioritas 4: kata sama tapi urutan beda ('Bagian jangka pendek dari
+        # liabilitas sewa' ≡ 'Liabilitas sewa bagian jangka pendek'), atau
+        # label naratif panjang yang 6 kata pertamanya sama (modal saham)
+        skey, pkey = _match_aux_keys(norm)
+        for index, k in ((sorted_index, skey), (prefix_index, pkey)):
+            if not k:
+                continue
+            entries_aux = [(i, t) for i, t in index.get(k, [])
+                           if t != "section" and i not in used_this_doc]
+            uniq = {i for i, _ in entries_aux}
+            if len(uniq) == 1:
+                return next(iter(uniq))
+
+        # Prioritas 5: fuzzy match untuk typo OCR ringan ('Akrua' ≈ 'Akrual')
+        # — hanya jika kandidatnya tunggal dan sangat mirip (rasio ≥ 0.9)
+        if len(norm) >= 5:
+            close = difflib.get_close_matches(
+                norm, list(norm_index.keys()), n=2, cutoff=0.9)
+            fuzzy_idxs = set()
+            for c in close:
+                for i, t in norm_index[c]:
+                    if t != "section" and i not in used_this_doc:
+                        fuzzy_idxs.add(i)
+            if len(fuzzy_idxs) == 1:
+                return next(iter(fuzzy_idxs))
         return None
 
     # ── Langkah 3: proses setiap laporan ─────────────────────────────────
@@ -2946,9 +3137,15 @@ def _merge_reports_by_account(reports_list: list[dict]) -> dict:
                 master_rows.insert(insert_pos, new_row)
                 _shift_index(key_index, insert_pos)
                 _shift_index(norm_index, insert_pos)
+                _shift_index(sorted_index, insert_pos)
+                _shift_index(prefix_index, insert_pos)
                 used_this_doc = {i + 1 if i >= insert_pos else i for i in used_this_doc}
                 key_index.setdefault(key, []).append((insert_pos, tipe))
                 norm_index.setdefault(norm, []).append((insert_pos, tipe))
+                skey_new, pkey_new = _match_aux_keys(norm)
+                sorted_index.setdefault(skey_new, []).append((insert_pos, tipe))
+                if pkey_new:
+                    prefix_index.setdefault(pkey_new, []).append((insert_pos, tipe))
                 last_pos = insert_pos
                 used_this_doc.add(insert_pos)
 
