@@ -865,6 +865,30 @@ def reconstruct_labels(
         if not label:
             label = stripped
 
+        # Baris tanpa label bermakna (hanya angka/tanda baca) — biasanya
+        # angka yatim dari layout dwibahasa/dua kolom hasil OCR.
+        if re.fullmatch(r"[\d.,()\-\s%]*", label):
+            # Pola umum laporan dwibahasa: label total di satu baris
+            # ("JUMLAH ASET"), nilainya di baris berikutnya. Tempelkan
+            # angka yatim ke baris total/jumlah di atasnya yang masih
+            # punya slot nilai kosong.
+            if rows:
+                prev_row = rows[-1]
+                prev_label = str(prev_row.get("Keterangan", "")).lower()
+                is_total_like = any(kw in prev_label for kw in ("total", "jumlah"))
+                if is_total_like:
+                    empty_slots = [k for k in range(num_value_cols)
+                                   if prev_row.get(f"Nilai_{k+1}") is None]
+                    for v in nums:
+                        if not empty_slots:
+                            break
+                        prev_row[f"Nilai_{empty_slots.pop(0)+1}"] = v
+                    if prev_row["Tipe"] == "section":
+                        prev_row["Tipe"] = "total"
+            # Apapun hasilnya, jangan jadikan "akun" dengan nama berupa angka
+            i += 1
+            continue
+
         # ── Pisahkan nomor catatan dari nilai ─────────────────────────────
         # Layout: [Nilai_t1] [Catatan kecil] [Nilai_t0]
         # Catatan ada di TENGAH (bukan awal), tapi OCR kadang
@@ -913,6 +937,39 @@ def reconstruct_labels(
 
 
 # ---------------------------------------------------------------------------
+# Pre-cleaning teks OCR: perbaiki typo umum pada angka
+# ---------------------------------------------------------------------------
+
+# Huruf yang sering salah baca oleh OCR di dalam angka: O→0, Z→7, l/I→1, S→5, B→8
+_OCR_DIGIT_MAP = str.maketrans("OoZzlISB", "00771158")
+
+
+def _preclean_ocr_line(line: str) -> str:
+    """
+    Perbaiki typo OCR umum pada angka SEBELUM parsing:
+    - Pemisah ganda:  '6,326,.921' / '381.,453'  → '6,326,921' / '381,453'
+    - Spasi di dalam angka: '19. 063'            → '19.063'
+    - Huruf mirip digit di token angka: '19,063,10Z' → '19,063,107'
+      (hanya jika token didominasi digit DAN punya pemisah ribuan,
+       supaya kata biasa tidak ikut berubah)
+    """
+    # Pemisah ganda ".," / ",." / ".." di antara digit → satu pemisah
+    line = re.sub(r"(?<=\d)[.,]{2,}(?=\d)", ",", line)
+    # Spasi setelah pemisah ribuan di dalam angka
+    line = re.sub(r"(?<=\d)([.,])\s+(?=\d{3}(?:\D|$))", r"\1", line)
+
+    def _fix_token(m: re.Match) -> str:
+        tok = m.group(0)
+        n_digits = sum(ch.isdigit() for ch in tok)
+        n_alpha  = sum(ch.isalpha() for ch in tok)
+        if n_digits >= 4 and n_alpha <= 2 and ("." in tok or "," in tok):
+            return tok.translate(_OCR_DIGIT_MAP)
+        return tok
+
+    return re.sub(r"[\d.,()OoZzlISB]+", _fix_token, line)
+
+
+# ---------------------------------------------------------------------------
 # Entry point: parse_ocr_text (menggabungkan 3 langkah)
 # ---------------------------------------------------------------------------
 
@@ -928,7 +985,7 @@ def parse_ocr_text(text: str, num_value_cols: int = 2) -> pd.DataFrame:
     maka otomatis pakai jumlah tahun tersebut. Ini memastikan laporan
     dengan 4 kolom tahun menghasilkan 4 Nilai_ kolom, bukan 2.
     """
-    lines = text.split("\n")
+    lines = [_preclean_ocr_line(l) for l in text.split("\n")]
 
     # Langkah 1 — deteksi header
     header_info = detect_header_row(lines, scan_rows=8)

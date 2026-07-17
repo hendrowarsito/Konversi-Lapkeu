@@ -383,5 +383,51 @@ for inp, exp in clean_cases:
 
 
 print("\n" + "="*70)
+print("TEST 7: _preclean_ocr_line — perbaiki typo OCR pada angka")
+print("="*70)
+preclean_cases = [
+    ("19,063,10Z",        "19,063,107"),   # Z → 7
+    ("6,326,.921",        "6,326,921"),    # pemisah ganda
+    ("381.,453",          "381,453"),      # pemisah ganda
+    ("19. 063",           "19.063"),       # spasi dalam angka
+    ("8.596.47Z",         "8.596.477"),    # Z → 7
+    ("Kas dan setara kas","Kas dan setara kas"),  # teks biasa tidak berubah
+    ("SOLO BLOK ZIS",     "SOLO BLOK ZIS"),       # kata mirip digit tidak berubah
+    ("Catatan 2022 2021", "Catatan 2022 2021"),   # tahun tidak berubah
+]
+for inp, exp in preclean_cases:
+    test(f"preclean('{inp}') → '{exp}'", app._preclean_ocr_line(inp), exp)
+
+
+print("\n" + "="*70)
+print("TEST 8: Angka yatim — tidak jadi nama akun, menempel ke total di atasnya")
+print("="*70)
+bilingual_text = """
+LAPORAN POSISI KEUANGAN
+Catatan   2022        2021
+
+ASET LANCAR
+Kas dan setara kas        4    1,062,777    816,746
+JUMLAH ASET
+19,063,107
+6,326,921
+"""
+df8 = app.parse_ocr_text(bilingual_text, num_value_cols=2)
+print(df8.to_string(index=False))
+labels8 = [str(x) for x in df8["Keterangan"]]
+numeric_labels = [l for l in labels8
+                  if l and __import__("re").fullmatch(r"[\d.,()\-\s%]+", l)]
+test("Tidak ada baris dengan nama akun berupa angka", numeric_labels, [])
+jumlah = df8[df8["Keterangan"] == "JUMLAH ASET"]
+if len(jumlah) > 0:
+    r = jumlah.iloc[0]
+    test("JUMLAH ASET jadi baris 'total'", r["Tipe"], "total")
+    test("JUMLAH ASET Nilai_1 = 19.063.107 (dari angka yatim)", r["Nilai_1"], 19063107.0)
+    test("JUMLAH ASET Nilai_2 = 6.326.921 (dari angka yatim kedua)", r["Nilai_2"], 6326921.0)
+else:
+    test("Baris 'JUMLAH ASET' ditemukan", False, True)
+
+
+print("\n" + "="*70)
 print("SELESAI — Semua test algoritma 3-langkah")
 print("="*70)
